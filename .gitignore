@@ -3,3 +3,4 @@ ocr_env/
 docs/
 images/
 output/
+.env
