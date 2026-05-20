@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -16,9 +17,36 @@ from PIL import Image
 from paddleocr import TextDetection
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-OCR_PROMPT = "Text Recognition:"
+GLM_OCR_PROMPT = "Text Recognition:"
+OPENROUTER_SYSTEM_PROMPT = (
+    "You are an OCR engine. Transcribe only the visible text. "
+    "Never describe the image, never explain, never use markdown."
+)
+OPENROUTER_OCR_PROMPT = (
+    "Transcribe the text in this image. "
+    "Reply with ONLY the raw characters exactly as written. "
+    "No descriptions, labels, markdown, quotes, or extra words."
+)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_OPENROUTER_MODEL = "qwen/qwen3-vl-8b-instruct"
+
+_NARRATION_PREFIXES = (
+    r"^based on the image provided[,\s:;-]*",
+    r"^here is the text recognition[:\s-]*",
+    r"^the text in the image (?:is|reads|shows|says)[:\s-]*",
+    r"^the image shows[:\s-]*",
+    r"^this image (?:shows|contains|displays)[:\s-]*",
+    r"^the visible text (?:is|reads|says)[:\s-]*",
+    r"^text recognition[:\s-]*",
+    r"^ocr result[:\s-]*",
+    r"^transcription[:\s-]*",
+    r"^output[:\s-]*",
+)
+_NARRATION_FIELD_PREFIXES = (
+    r"^(?:a |the )?(?:form )?field labeled\s*",
+    r"^(?:a |the )?(?:form )?label(?:ed)?\s*",
+    r"^a portion of (?:a )?(?:form|document)(?:\s+or\s+document)?\s*(?:related to|about|for|containing)\s*",
+)
 
 _det_model = None
 _glm_processor = None
@@ -36,6 +64,38 @@ class PipelineConfig:
     batch_size: int = 16
     max_new_tokens: int = 64
     line_merge_ratio: float = 0.6
+
+
+def sanitize_ocr_text(text):
+    """Strip chatty model preambles and keep only transcribed content."""
+    if not text:
+        return ""
+
+    cleaned = text.strip()
+    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"\*([^*]+)\*", r"\1", cleaned)
+    cleaned = cleaned.replace("??", "").strip()
+
+    for _ in range(4):
+        original = cleaned
+        for pattern in _NARRATION_PREFIXES:
+            cleaned = re.sub(pattern, "", cleaned, count=1, flags=re.IGNORECASE).strip()
+        for pattern in _NARRATION_FIELD_PREFIXES:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).strip()
+        if cleaned == original:
+            break
+
+    for sep in ("reads:", "reads as:", "recognition:", "transcription:", "is:"):
+        lower = cleaned.lower()
+        if sep in lower:
+            candidate = cleaned[lower.rfind(sep) + len(sep) :].strip()
+            if candidate:
+                cleaned = candidate
+
+    cleaned = cleaned.strip("\"'` ")
+    cleaned = re.sub(r"^[=\-–—:]+\s*", "", cleaned)
+    cleaned = re.sub(r"[^\S\n]+", " ", cleaned).strip()
+    return cleaned
 
 
 def load_dotenv(path=".env"):
@@ -275,16 +335,17 @@ def recognize_openrouter(pil_images, config):
         payload = {
             "model": config.openrouter_model,
             "messages": [
+                {"role": "system", "content": OPENROUTER_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": OCR_PROMPT},
                         {
                             "type": "image_url",
                             "image_url": {"url": pil_to_data_url(pil_img)},
                         },
+                        {"type": "text", "text": OPENROUTER_OCR_PROMPT},
                     ],
-                }
+                },
             ],
             "max_tokens": config.max_new_tokens,
             "temperature": 0,
@@ -311,7 +372,7 @@ def recognize_openrouter(pil_images, config):
         if not choices:
             raise RuntimeError(f"OpenRouter returned no choices: {body}")
         message = choices[0].get("message") or {}
-        return index, (message.get("content") or "").strip()
+        return index, sanitize_ocr_text(message.get("content") or "")
 
     workers = min(len(pil_images), config.batch_size, 8)
     if workers <= 1:
@@ -345,7 +406,7 @@ def recognize_glm_batch(pil_images, config):
                     "role": "user",
                     "content": [
                         {"type": "image", "image": pil_img},
-                        {"type": "text", "text": OCR_PROMPT},
+                        {"type": "text", "text": GLM_OCR_PROMPT},
                     ],
                 }
             ]
@@ -367,10 +428,12 @@ def recognize_glm_batch(pil_images, config):
 
         input_len = inputs["input_ids"].shape[1]
         for row in range(outputs.shape[0]):
-            decoded = processor.decode(
-                outputs[row][input_len:],
-                skip_special_tokens=True,
-            ).strip()
+            decoded = sanitize_ocr_text(
+                processor.decode(
+                    outputs[row][input_len:],
+                    skip_special_tokens=True,
+                )
+            )
             texts.append(decoded)
 
     return texts
@@ -643,7 +706,7 @@ def parse_args():
     parser.add_argument(
         "--mode",
         choices=("page", "line", "accurate"),
-        default="line",
+        default="accurate",
         help="page=1 call/page (~30s), line=merged lines (balanced), accurate=1 call/box (slow)",
     )
     parser.add_argument(
@@ -653,13 +716,13 @@ def parse_args():
     )
     parser.add_argument(
         "--det-model",
-        default=None,
+        default="PP-OCRv5_server_det",
         help="Paddle detection model (default: mobile for line/page, server for accurate)",
     )
     parser.add_argument(
         "--pdf-zoom",
         type=float,
-        default=None,
+        default=2.0,
         help="PDF render scale (default: 1.5 for line/page, 2.0 for accurate)",
     )
     parser.add_argument(
