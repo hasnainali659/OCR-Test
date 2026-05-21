@@ -29,6 +29,34 @@ OPENROUTER_OCR_PROMPT = (
 )
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_OPENROUTER_MODEL = "qwen/qwen3-vl-8b-instruct"
+DEFAULT_OPENROUTER_MODEL_URDU = "qwen/qwen3-vl-32b-instruct"
+QAARI_MODEL_ID = "oddadmix/Qaari-0.1-Urdu-OCR-VL-2B-Instruct"
+QAARI_OCR_PROMPT = (
+    "Return only the Urdu text visible in this image, exactly as written in Nastaliq script. "
+    "Do not add explanations."
+)
+
+URDU_OPENROUTER_SYSTEM_PROMPT = (
+    "You are an Urdu OCR engine for Nastaliq (Perso-Arabic) script. "
+    "Return only transcribed Urdu text. Never describe the image."
+)
+URDU_OPENROUTER_OCR_PROMPT = (
+    "Transcribe the Urdu text in Nastaliq script exactly as written. "
+    "Preserve Urdu letters, diacritics, and ligatures. "
+    "Do not transliterate to English or Roman Urdu. Output only the Urdu text."
+)
+BILINGUAL_OPENROUTER_SYSTEM_PROMPT = (
+    "You are a bilingual OCR engine for English and Urdu (Nastaliq). "
+    "Return only transcribed text. Never describe the image."
+)
+BILINGUAL_OPENROUTER_OCR_PROMPT = (
+    "Transcribe all visible text exactly as written. "
+    "Keep English in Latin script and Urdu in Nastaliq Perso-Arabic script. "
+    "Do not transliterate Urdu to Roman letters or wrong Arabic forms. "
+    "Output only the raw text."
+)
+EN_OPENROUTER_SYSTEM_PROMPT = OPENROUTER_SYSTEM_PROMPT
+EN_OPENROUTER_OCR_PROMPT = OPENROUTER_OCR_PROMPT
 
 _NARRATION_PREFIXES = (
     r"^based on the image provided[,\s:;-]*",
@@ -52,18 +80,29 @@ _det_model = None
 _glm_processor = None
 _glm_model = None
 _glm_device = None
+_qaari_processor = None
+_qaari_model = None
+_qaari_device = None
 
 
 @dataclass
 class PipelineConfig:
     backend: str = "openrouter"
     mode: str = "line"
+    lang: str = "bilingual"
     openrouter_model: str = DEFAULT_OPENROUTER_MODEL
     det_model_name: str = "PP-OCRv5_mobile_det"
     pdf_zoom: float = 1.5
     batch_size: int = 16
     max_new_tokens: int = 64
     line_merge_ratio: float = 0.6
+    max_horizontal_gap: int = 100
+    fragment_gap: int = 35
+    crop_padding: int = 6
+    min_crop_height: int = 48
+    image_max_side: int = 2048
+    jpeg_quality: int = 95
+    merge_fragments: bool = True
 
 
 def sanitize_ocr_text(text):
@@ -96,6 +135,14 @@ def sanitize_ocr_text(text):
     cleaned = re.sub(r"^[=\-–—:]+\s*", "", cleaned)
     cleaned = re.sub(r"[^\S\n]+", " ", cleaned).strip()
     return cleaned
+
+
+def get_openrouter_prompts(config):
+    if config.lang == "ur":
+        return URDU_OPENROUTER_SYSTEM_PROMPT, URDU_OPENROUTER_OCR_PROMPT
+    if config.lang == "en":
+        return EN_OPENROUTER_SYSTEM_PROMPT, EN_OPENROUTER_OCR_PROMPT
+    return BILINGUAL_OPENROUTER_SYSTEM_PROMPT, BILINGUAL_OPENROUTER_OCR_PROMPT
 
 
 def load_dotenv(path=".env"):
@@ -210,6 +257,28 @@ def get_glm_model():
     return _glm_processor, _glm_model, _glm_device
 
 
+def get_qaari_model():
+    global _qaari_processor, _qaari_model, _qaari_device
+    if _qaari_model is not None:
+        return _qaari_processor, _qaari_model, _qaari_device
+
+    import torch
+    from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+
+    print(f"Loading Qaari Urdu OCR ({QAARI_MODEL_ID})...")
+    _qaari_device = "cuda" if torch.cuda.is_available() else "cpu"
+    _qaari_processor = AutoProcessor.from_pretrained(QAARI_MODEL_ID)
+    _qaari_model = Qwen2VLForConditionalGeneration.from_pretrained(
+        QAARI_MODEL_ID,
+        torch_dtype="auto",
+        device_map="auto" if _qaari_device == "cuda" else None,
+    ).eval()
+    if _qaari_device != "cuda":
+        _qaari_model = _qaari_model.to(_qaari_device)
+    print(f"Qaari loaded on {_qaari_device}.")
+    return _qaari_processor, _qaari_model, _qaari_device
+
+
 def _box_bounds(box):
     x_coords = [point[0] for point in box]
     y_coords = [point[1] for point in box]
@@ -243,8 +312,8 @@ def detect_boxes(img_bgr, det_model_name):
     return _normalize_polys(result.get("dt_polys"))
 
 
-def merge_boxes_into_lines(boxes, merge_ratio=0.6):
-    """Cluster detection boxes into text lines to reduce recognizer calls."""
+def merge_adjacent_fragments(boxes, config):
+    """Join tiny adjacent detection boxes on the same row (common with Urdu Nastaliq)."""
     if not boxes:
         return []
 
@@ -265,50 +334,116 @@ def merge_boxes_into_lines(boxes, merge_ratio=0.6):
         )
 
     items.sort(key=lambda item: (item["y_center"], item["x_min"]))
-    lines = []
+    merged_items = [items[0]]
+    for item in items[1:]:
+        prev = merged_items[-1]
+        y_threshold = max(prev["height"], item["height"]) * config.line_merge_ratio
+        x_gap = item["x_min"] - prev["x_max"]
+        if (
+            abs(item["y_center"] - prev["y_center"]) <= y_threshold
+            and x_gap <= config.fragment_gap
+        ):
+            merged_items[-1] = {
+                "box": [
+                    [min(prev["x_min"], item["x_min"]), min(prev["y_min"], item["y_min"])],
+                    [max(prev["x_max"], item["x_max"]), min(prev["y_min"], item["y_min"])],
+                    [max(prev["x_max"], item["x_max"]), max(prev["y_max"], item["y_max"])],
+                    [min(prev["x_min"], item["x_min"]), max(prev["y_max"], item["y_max"])],
+                ],
+                "x_min": min(prev["x_min"], item["x_min"]),
+                "y_min": min(prev["y_min"], item["y_min"]),
+                "x_max": max(prev["x_max"], item["x_max"]),
+                "y_max": max(prev["y_max"], item["y_max"]),
+                "y_center": (min(prev["y_min"], item["y_min"]) + max(prev["y_max"], item["y_max"])) / 2.0,
+                "height": max(prev["height"], item["height"]),
+            }
+        else:
+            merged_items.append(item)
+
+    return [item["box"] for item in merged_items]
+
+
+def prepare_detection_boxes(boxes, config):
+    if config.merge_fragments and config.lang in ("ur", "bilingual"):
+        boxes = merge_adjacent_fragments(boxes, config)
+    return boxes
+
+
+def merge_boxes_into_lines(boxes, merge_ratio=0.6, max_horizontal_gap=100):
+    """Cluster detection boxes into text lines, splitting English/Urdu columns."""
+    if not boxes:
+        return []
+
+    items = []
+    for box in boxes:
+        x_min, y_min, x_max, y_max = _box_bounds(box)
+        height = max(y_max - y_min, 1)
+        items.append(
+            {
+                "box": box,
+                "x_min": x_min,
+                "y_min": y_min,
+                "x_max": x_max,
+                "y_max": y_max,
+                "y_center": (y_min + y_max) / 2.0,
+                "height": height,
+            }
+        )
+
+    items.sort(key=lambda item: (item["y_center"], item["x_min"]))
+    row_groups = []
     for item in items:
-        if not lines:
-            lines.append([item])
+        if not row_groups:
+            row_groups.append([item])
             continue
 
-        current = lines[-1]
+        current = row_groups[-1]
         ref = current[-1]
         threshold = max(ref["height"], item["height"]) * merge_ratio
         if abs(item["y_center"] - ref["y_center"]) <= threshold:
             current.append(item)
         else:
-            lines.append([item])
+            row_groups.append([item])
 
     merged = []
-    for line_items in lines:
-        x_min = min(item["x_min"] for item in line_items)
-        y_min = min(item["y_min"] for item in line_items)
-        x_max = max(item["x_max"] for item in line_items)
-        y_max = max(item["y_max"] for item in line_items)
-        merged_box = [
-            [x_min, y_min],
-            [x_max, y_min],
-            [x_max, y_max],
-            [x_min, y_max],
-        ]
-        merged.append(
-            {
-                "box": merged_box,
-                "x_min": x_min,
-                "y_min": y_min,
-                "x_max": x_max,
-                "y_max": y_max,
-            }
-        )
+    for row_items in row_groups:
+        row_items.sort(key=lambda item: item["x_min"])
+        segments = [[row_items[0]]]
+        for item in row_items[1:]:
+            gap = item["x_min"] - segments[-1][-1]["x_max"]
+            if gap > max_horizontal_gap:
+                segments.append([item])
+            else:
+                segments[-1].append(item)
+
+        for segment in segments:
+            x_min = min(item["x_min"] for item in segment)
+            y_min = min(item["y_min"] for item in segment)
+            x_max = max(item["x_max"] for item in segment)
+            y_max = max(item["y_max"] for item in segment)
+            merged.append(
+                {
+                    "box": [
+                        [x_min, y_min],
+                        [x_max, y_min],
+                        [x_max, y_max],
+                        [x_min, y_max],
+                    ],
+                    "x_min": x_min,
+                    "y_min": y_min,
+                    "x_max": x_max,
+                    "y_max": y_max,
+                }
+            )
     return merged
 
 
-def crop_box(img_bgr, bounds):
+def crop_box(img_bgr, bounds, padding=0):
     h, w = img_bgr.shape[:2]
-    x_min = max(0, bounds["x_min"])
-    y_min = max(0, bounds["y_min"])
-    x_max = min(w, bounds["x_max"])
-    y_max = min(h, bounds["y_max"])
+    x_min = max(0, bounds["x_min"] - padding)
+    y_min = max(0, bounds["y_min"] - padding)
+    x_max = min(w, bounds["x_max"] + padding)
+    y_max = min(h, bounds["y_max"] + padding)
     if x_max <= x_min or y_max <= y_min:
         return None
     crop = img_bgr[y_min:y_max, x_min:x_max]
@@ -317,33 +452,45 @@ def crop_box(img_bgr, bounds):
     return Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
 
 
-def pil_to_data_url(pil_img, max_side=1600):
-    """Resize large crops for faster API upload and inference."""
+def prepare_crop_for_ocr(pil_img, config):
+    width, height = pil_img.size
+    if height < config.min_crop_height:
+        scale = config.min_crop_height / max(height, 1)
+        pil_img = pil_img.resize(
+            (max(1, int(width * scale)), config.min_crop_height),
+            Image.Resampling.LANCZOS,
+        )
+    return pil_img
+
+
+def pil_to_data_url(pil_img, config):
+    """Resize large crops for API upload while preserving Urdu stroke detail."""
     img = pil_img.copy()
-    img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    img.thumbnail((config.image_max_side, config.image_max_side), Image.Resampling.LANCZOS)
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=85)
+    img.save(buffer, format="JPEG", quality=config.jpeg_quality)
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/jpeg;base64,{encoded}"
 
 
 def recognize_openrouter(pil_images, config):
     api_key = get_openrouter_api_key()
+    system_prompt, user_prompt = get_openrouter_prompts(config)
     texts = [""] * len(pil_images)
 
     def _call(index, pil_img):
         payload = {
             "model": config.openrouter_model,
             "messages": [
-                {"role": "system", "content": OPENROUTER_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": pil_to_data_url(pil_img)},
+                            "image_url": {"url": pil_to_data_url(pil_img, config)},
                         },
-                        {"type": "text", "text": OPENROUTER_OCR_PROMPT},
+                        {"type": "text", "text": user_prompt},
                     ],
                 },
             ],
@@ -389,6 +536,59 @@ def recognize_openrouter(pil_images, config):
         for future in as_completed(futures):
             idx, text = future.result()
             texts[idx] = text
+    return texts
+
+
+def recognize_qaari_batch(pil_images, config):
+    import torch
+
+    try:
+        from qwen_vl_utils import process_vision_info
+    except ImportError as exc:
+        raise RuntimeError(
+            "Qaari backend requires qwen-vl-utils. Install with: pip install qwen-vl-utils"
+        ) from exc
+
+    processor, model, device = get_qaari_model()
+    texts = []
+
+    for pil_img in pil_images:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil_img},
+                    {"type": "text", "text": QAARI_OCR_PROMPT},
+                ],
+            }
+        ]
+        prompt = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[prompt],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(device)
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=config.max_new_tokens)
+        trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs.input_ids, outputs)
+        ]
+        decoded = processor.batch_decode(
+            trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0]
+        texts.append(sanitize_ocr_text(decoded))
+
     return texts
 
 
@@ -442,43 +642,54 @@ def recognize_glm_batch(pil_images, config):
 def recognize_crops(pil_images, config):
     if not pil_images:
         return []
+    prepared = [prepare_crop_for_ocr(img, config) for img in pil_images]
     if config.backend == "openrouter":
-        return recognize_openrouter(pil_images, config)
-    return recognize_glm_batch(pil_images, config)
+        return recognize_openrouter(prepared, config)
+    if config.backend == "qaari":
+        return recognize_qaari_batch(prepared, config)
+    return recognize_glm_batch(prepared, config)
+
+
+def _crop_from_box(img_bgr, box, config):
+    x_min, y_min, x_max, y_max = _box_bounds(box)
+    return crop_box(
+        img_bgr,
+        {"x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max},
+        padding=config.crop_padding,
+    )
 
 
 def process_page_accurate(img_bgr, config, progress_label=""):
-    boxes = detect_boxes(img_bgr, config.det_model_name)
+    boxes = prepare_detection_boxes(detect_boxes(img_bgr, config.det_model_name), config)
     extracted = []
     total = len(boxes)
 
     for index, box in enumerate(boxes, start=1):
         if progress_label:
             print(f"{progress_label} box {index}/{total} (accurate)...")
-        x_min, y_min, x_max, y_max = _box_bounds(box)
-        pil_img = crop_box(
-            img_bgr,
-            {"x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max},
-        )
+        pil_img = _crop_from_box(img_bgr, box, config)
         if pil_img is None:
             continue
         text = recognize_crops([pil_img], config)[0]
-        entry = _bounds_to_entry(box, text)
-        extracted.append(entry)
+        extracted.append(_bounds_to_entry(box, text))
 
     return extracted
 
 
 def process_page_line(img_bgr, config, progress_label=""):
-    boxes = detect_boxes(img_bgr, config.det_model_name)
-    lines = merge_boxes_into_lines(boxes, config.line_merge_ratio)
+    boxes = prepare_detection_boxes(detect_boxes(img_bgr, config.det_model_name), config)
+    lines = merge_boxes_into_lines(
+        boxes,
+        config.line_merge_ratio,
+        config.max_horizontal_gap,
+    )
     if progress_label:
         print(f"{progress_label} {len(boxes)} boxes -> {len(lines)} lines.")
 
     pil_images = []
     line_meta = []
     for line in lines:
-        pil_img = crop_box(img_bgr, line)
+        pil_img = crop_box(img_bgr, line, padding=config.crop_padding)
         if pil_img is None:
             continue
         pil_images.append(pil_img)
@@ -511,7 +722,7 @@ def process_page_page_mode(img_bgr, config, progress_label=""):
         }
     ]
 
-    boxes = detect_boxes(img_bgr, config.det_model_name)
+    boxes = prepare_detection_boxes(detect_boxes(img_bgr, config.det_model_name), config)
     for box in boxes:
         entry = _bounds_to_entry(box, "")
         entry["detection_only"] = True
@@ -534,7 +745,7 @@ def process_handwritten_document(input_path, config):
     multi_page = len(pages) > 1
 
     print(
-        f"Backend={config.backend}, mode={config.mode}, "
+        f"Backend={config.backend}, mode={config.mode}, lang={config.lang}, "
         f"det={config.det_model_name}, zoom={config.pdf_zoom}"
     )
 
@@ -647,18 +858,30 @@ def save_annotated_document(input_path, results, output_path, pdf_zoom=1.5):
 
 def build_config_from_args(args):
     mode = args.mode
+    lang = args.lang
+    urdu_doc = lang in ("ur", "bilingual")
+
     if mode == "accurate":
         det_model = args.det_model or "PP-OCRv5_server_det"
-        pdf_zoom = args.pdf_zoom if args.pdf_zoom is not None else 2.0
-        max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else 128
+        pdf_zoom = args.pdf_zoom if args.pdf_zoom is not None else (2.0 if urdu_doc else 2.0)
+        max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else (96 if urdu_doc else 128)
     elif mode == "page":
         det_model = args.det_model or "PP-OCRv5_mobile_det"
-        pdf_zoom = args.pdf_zoom if args.pdf_zoom is not None else 1.5
+        pdf_zoom = args.pdf_zoom if args.pdf_zoom is not None else (2.0 if urdu_doc else 1.5)
         max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else 512
     else:
         det_model = args.det_model or "PP-OCRv5_mobile_det"
-        pdf_zoom = args.pdf_zoom if args.pdf_zoom is not None else 1.5
-        max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else 64
+        pdf_zoom = args.pdf_zoom if args.pdf_zoom is not None else (2.0 if urdu_doc else 1.5)
+        max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else (96 if urdu_doc else 64)
+
+    model = args.model
+    if (
+        args.backend == "openrouter"
+        and model == DEFAULT_OPENROUTER_MODEL
+        and urdu_doc
+    ):
+        model = DEFAULT_OPENROUTER_MODEL_URDU
+        print(f"Using Urdu-optimized OpenRouter model: {model}")
 
     backend = args.backend
     if backend == "glm":
@@ -667,18 +890,26 @@ def build_config_from_args(args):
         if not torch.cuda.is_available():
             print(
                 "Warning: CUDA not available. GLM-OCR on CPU is very slow; "
-                "consider --backend openrouter."
+                "consider --backend openrouter or --backend qaari."
             )
+    if backend == "qaari" and lang == "en":
+        print("Warning: Qaari is Urdu-only. English text quality may be poor.")
 
     return PipelineConfig(
         backend=backend,
         mode=mode,
-        openrouter_model=args.model,
+        lang=lang,
+        openrouter_model=model,
         det_model_name=det_model,
         pdf_zoom=pdf_zoom,
         batch_size=args.batch_size,
         max_new_tokens=max_new_tokens,
         line_merge_ratio=args.line_merge_ratio,
+        max_horizontal_gap=args.horizontal_gap,
+        fragment_gap=args.fragment_gap,
+        crop_padding=args.crop_padding,
+        min_crop_height=args.min_crop_height,
+        merge_fragments=not args.no_merge_fragments,
     )
 
 
@@ -689,7 +920,7 @@ def parse_args():
     parser.add_argument(
         "input_path",
         nargs="?",
-        default="docs/OneDrive_1_5-20-2026/Amir_Hafeez.pdf",
+        default="docs/OneDrive_1_5-20-2026/Sana Patel.pdf",
         help="Path to an image (.jpg, .png, ...) or .pdf file",
     )
     parser.add_argument(
@@ -699,15 +930,21 @@ def parse_args():
     )
     parser.add_argument(
         "--backend",
-        choices=("glm", "openrouter"),
+        choices=("glm", "openrouter", "qaari"),
         default="openrouter",
-        help="Recognition backend (default: openrouter)",
+        help="Recognition backend (default: openrouter). qaari=local Urdu-specialized model.",
     )
     parser.add_argument(
         "--mode",
         choices=("page", "line", "accurate"),
-        default="accurate",
-        help="page=1 call/page (~30s), line=merged lines (balanced), accurate=1 call/box (slow)",
+        default="line",
+        help="page=1 call/page, line=merged lines (recommended), accurate=1 call/box (slow)",
+    )
+    parser.add_argument(
+        "--lang",
+        choices=("en", "ur", "bilingual"),
+        default="bilingual",
+        help="Language focus for prompts and preprocessing (default: bilingual)",
     )
     parser.add_argument(
         "--model",
@@ -716,14 +953,14 @@ def parse_args():
     )
     parser.add_argument(
         "--det-model",
-        default="PP-OCRv5_server_det",
+        default=None,
         help="Paddle detection model (default: mobile for line/page, server for accurate)",
     )
     parser.add_argument(
         "--pdf-zoom",
         type=float,
-        default=2.0,
-        help="PDF render scale (default: 1.5 for line/page, 2.0 for accurate)",
+        default=None,
+        help="PDF render scale (default: 2.0 for Urdu/bilingual, 1.5 otherwise)",
     )
     parser.add_argument(
         "--batch-size",
@@ -742,6 +979,35 @@ def parse_args():
         type=float,
         default=0.6,
         help="Line clustering threshold as a fraction of box height (default: 0.6)",
+    )
+    parser.add_argument(
+        "--horizontal-gap",
+        type=int,
+        default=100,
+        help="Split merged lines when horizontal gap exceeds this many pixels (default: 100)",
+    )
+    parser.add_argument(
+        "--fragment-gap",
+        type=int,
+        default=35,
+        help="Merge adjacent same-row boxes when gap <= this many pixels (default: 35)",
+    )
+    parser.add_argument(
+        "--crop-padding",
+        type=int,
+        default=6,
+        help="Padding around each crop in pixels (default: 6)",
+    )
+    parser.add_argument(
+        "--min-crop-height",
+        type=int,
+        default=48,
+        help="Upscale small crops to at least this height in pixels (default: 48)",
+    )
+    parser.add_argument(
+        "--no-merge-fragments",
+        action="store_true",
+        help="Disable merging of tiny adjacent Urdu detection fragments",
     )
     return parser.parse_args()
 
